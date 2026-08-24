@@ -1,0 +1,158 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>air-quality-cards dev harness</title>
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; background:#131318; padding:32px; display:flex; flex-direction:column; gap:26px; font-family:monospace; }
+  h2 { color:#8b8d96; font:12px monospace; margin:0; letter-spacing:0.1em; text-transform:uppercase; }
+  .theme { display:flex; flex-direction:column; gap:20px; }
+  .row { display:flex; gap:18px; align-items:stretch; flex-wrap:wrap; }
+  .col { width:340px; height:430px; display:flex; flex-direction:column; gap:8px; }
+  .col > :last-child { flex:1; min-height:0; }
+  .col.wide { width:100%; max-width:1080px; height:auto; }
+  .col.wide > :last-child { flex:none; }
+  .col.phone { width:360px; height:auto; }
+  .col.phone > :last-child { flex:none; }
+  .hdg { font:500 16px/1.3 system-ui,-apple-system,sans-serif; color:var(--primary-text-color,#e1e1e1); padding:0 4px; }
+  #dark {
+    --ha-card-background:#1c1c1c;
+    --card-background-color:#1c1c1c;
+    --primary-text-color:#e1e1e1;
+    --secondary-text-color:#9b9b9b;
+    --disabled-text-color:#64646b;
+    --divider-color:rgba(225,225,225,0.12);
+    --ha-card-border-radius:12px;
+  }
+  #light-wrap { background:#f2f4f7; padding:24px; border-radius:14px; }
+  #light {
+    --ha-card-background:#ffffff;
+    --card-background-color:#ffffff;
+    --primary-text-color:#212121;
+    --secondary-text-color:#727272;
+    --disabled-text-color:#a2a2a8;
+    --divider-color:rgba(0,0,0,0.12);
+    --ha-card-border-radius:12px;
+  }
+</style>
+<script src="../air-quality-cards.js"></script>
+<script>
+customElements.define('ha-card', class extends HTMLElement {
+  connectedCallback() {
+    this.style.background = 'var(--ha-card-background, #1c1c1c)';
+    this.style.borderRadius = 'var(--ha-card-border-radius, 12px)';
+    this.style.border = '1px solid var(--divider-color, transparent)';
+    this.style.overflow = 'hidden';
+  }
+});
+</script>
+</head>
+<body>
+<div class="theme" id="dark-theme">
+  <h2>HA default dark theme</h2>
+  <div class="row" id="dark"></div>
+</div>
+<div id="light-wrap">
+  <div class="theme" id="light-theme">
+    <h2>HA default light theme</h2>
+    <div class="row" id="light"></div>
+  </div>
+</div>
+<script>
+const entity = (state, unit, minutesAgo = 1) => ({
+  state: String(state),
+  last_updated: new Date(Date.now() - minutesAgo * 60000).toISOString(),
+  attributes: { unit_of_measurement: unit },
+});
+
+const makeHass = (darkMode, scenario = 'healthy') => {
+  const elevated = scenario === 'alert';
+  const states = {
+    'sensor.upstairs_radon': entity(7, 'Bq/m³', 2),
+    'sensor.upstairs_radon_30d': entity(11, 'Bq/m³', 60),
+    'sensor.upstairs_co2': entity(561, 'ppm', 1),
+    'sensor.upstairs_pm25': entity(1, 'µg/m³', 1),
+    'sensor.upstairs_voc': entity(elevated ? 326 : 174, 'ppb', 1),
+    'sensor.upstairs_temperature': entity(73.6, '°F', 2),
+    'sensor.upstairs_humidity': entity(48, '%', 2),
+    'sensor.basement_radon': entity(elevated ? 164 : 15, 'Bq/m³', 3),
+    'sensor.basement_radon_30d': entity(elevated ? 151 : 22, 'Bq/m³', 60),
+    'sensor.basement_co2': entity(595, 'ppm', 1),
+    'sensor.basement_pm25': entity(2, 'µg/m³', 1),
+    'sensor.basement_voc': entity(147, 'ppb', 1),
+    'sensor.basement_temperature': entity(73.4, '°F', 2),
+    'sensor.basement_humidity': entity(48, '%', 2),
+  };
+  if (scenario === 'partial') {
+    states['sensor.upstairs_voc'].state = 'unavailable';
+    delete states['sensor.basement_pm25'];
+  }
+  return { themes: { darkMode }, states };
+};
+
+const ROOMS = [
+  {
+    name: 'Upstairs',
+    radon: 'sensor.upstairs_radon',
+    radon_average: 'sensor.upstairs_radon_30d',
+    co2: 'sensor.upstairs_co2',
+    pm25: 'sensor.upstairs_pm25',
+    voc: 'sensor.upstairs_voc',
+    temperature: 'sensor.upstairs_temperature',
+    humidity: 'sensor.upstairs_humidity',
+  },
+  {
+    name: 'Basement',
+    radon: 'sensor.basement_radon',
+    radon_average: 'sensor.basement_radon_30d',
+    co2: 'sensor.basement_co2',
+    pm25: 'sensor.basement_pm25',
+    voc: 'sensor.basement_voc',
+    temperature: 'sensor.basement_temperature',
+    humidity: 'sensor.basement_humidity',
+  },
+];
+
+function addCard(row, tag, heading, config, hass, className = '') {
+  const wrap = document.createElement('div');
+  wrap.className = `col ${className}`.trim();
+  const h = document.createElement('div');
+  h.className = 'hdg';
+  h.textContent = heading;
+  const card = document.createElement(tag);
+  card.setConfig(config);
+  card.hass = hass;
+  wrap.append(h, card);
+  document.getElementById(row).appendChild(wrap);
+}
+
+function addSuite(row, hass) {
+  addCard(row, 'air-quality-cards-overview', 'Air quality', { rooms: ROOMS }, hass, 'wide');
+  addCard(row, 'air-quality-cards-room', 'Upstairs', { room: ROOMS[0] }, hass);
+  addCard(row, 'air-quality-cards-room', 'Basement', { room: ROOMS[1] }, hass);
+  addCard(row, 'air-quality-cards-radon', 'Radon', { rooms: ROOMS }, hass, 'wide');
+  addCard(row, 'air-quality-cards-overview', 'Phone width', { rooms: ROOMS }, hass, 'phone');
+}
+
+const scenario = (/[?&]scenario=(\w+)/.exec(location.search) || [])[1];
+addSuite('dark', makeHass(true, scenario || 'alert'));
+addSuite('light', makeHass(false, scenario || 'healthy'));
+
+const only = (/[?&]row=(\w+)/.exec(location.search) || [])[1];
+if (only === 'dark') document.getElementById('light-wrap').remove();
+if (only === 'light') {
+  document.getElementById('dark-theme').remove();
+  document.body.style.background = '#f2f4f7';
+  document.getElementById('light-wrap').style.padding = '0';
+}
+
+const show = (/[?&]show=(\w+)/.exec(location.search) || [])[1];
+if (show === 'overview') document.querySelectorAll('.col:not(.wide), .col.phone').forEach((el) => el.remove());
+if (show === 'cards') document.querySelectorAll('.col.wide, .col.phone').forEach((el) => el.remove());
+if (show === 'phone') document.querySelectorAll('.col:not(.phone)').forEach((el) => el.remove());
+if (show === 'dashboard') document.querySelectorAll('.col.phone').forEach((el) => el.remove());
+</script>
+</body>
+</html>
