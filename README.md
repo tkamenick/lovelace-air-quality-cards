@@ -1,6 +1,6 @@
 # Air Quality Cards
 
-Three custom Lovelace cards for Home Assistant that turn indoor-air sensors into a calm,
+Five custom Lovelace cards for Home Assistant that turn indoor-air sensors into a calm,
 room-first dashboard. They share the visual language of
 [Sun Cards](https://github.com/tkamenick/lovelace-sun-cards): the same typography, theme-aware
 surfaces, compact telemetry, restrained accent colors, responsive behavior, and one strong
@@ -17,8 +17,10 @@ The cards also adapt their accents for light themes:
 | **Overview** | `custom:air-quality-cards-overview` | Is the house okay, which room needs attention, and which pollutant is driving the status? |
 | **Room** | `custom:air-quality-cards-room` | What is happening in this room, and where does each reading sit in its configured range? |
 | **Radon** | `custom:air-quality-cards-radon` | How do rooms compare to the action level, and what long-term average should I judge? |
+| **Trend** | `custom:air-quality-cards-trend` | How have one room's differently-scaled pollutants moved over the last day? |
+| **Radon Trend** | `custom:air-quality-cards-radon-trend` | How do daily radon means and maxima compare across rooms and to the action level? |
 
-All three are dependency-free and bundled in one file. Clicking any configured reading opens
+All five are dependency-free and bundled in one file. Clicking any configured reading opens
 Home Assistant's normal more-info dialog.
 
 ## Install with HACS
@@ -50,8 +52,7 @@ room:
 
 The Overview and Radon cards take a `rooms:` list instead. See
 [`examples/air-quality-view.yaml`](examples/air-quality-view.yaml) for a complete two-room
-sections dashboard that keeps Home Assistant's native 30-day statistics graph below the custom
-radon card.
+sections dashboard with matching recorder-backed room and radon history cards.
 
 When `radon_average` is configured, the Overview and Room cards use that average for their
 status, dial, and focus callout. The Radon card still shows the live reading and presents the
@@ -128,9 +129,61 @@ rooms:
     humidity: sensor.basement_humidity
 ```
 
+### Room history
+
+The Trend card requests Home Assistant recorder statistics directly. Each metric gets its own
+small-multiple line and threshold scale, so a 550 ppm CO₂ series does not flatten a 2 µg/m³
+PM2.5 series. No extra chart integration is required.
+
+```yaml
+type: custom:air-quality-cards-trend
+name: Upstairs trend
+hours_to_show: 24
+period: 5minute
+room:
+  name: Upstairs
+  co2: sensor.upstairs_co2
+  pm25: sensor.upstairs_pm2_5
+  voc: sensor.upstairs_voc
+```
+
+For advanced layouts, provide `series:` instead of `room:`. Every series needs an entity and a
+metric so the card can apply the right unit, color, and thresholds.
+
+```yaml
+type: custom:air-quality-cards-trend
+name: Workshop trend
+series:
+  - entity: sensor.workshop_carbon_dioxide
+    name: CO₂
+    metric: co2
+  - entity: sensor.workshop_pm2_5
+    name: PM2.5
+    metric: pm25
+```
+
+### Radon history
+
+```yaml
+type: custom:air-quality-cards-radon-trend
+name: Radon history
+days_to_show: 30
+period: day
+show_max: true
+rooms:
+  - name: Basement
+    radon: sensor.basement_radon
+  - name: Upstairs
+    radon: sensor.upstairs_radon
+```
+
+The solid lines are daily means; optional dashed lines are daily maxima. The chart always marks
+the configured radon action threshold. Both trend cards refresh recorder data automatically and
+show a calm empty state when statistics are unavailable.
+
 The Overview and Radon cards request `rows: auto` because both switch from side-by-side to
 stacked layouts based on their own rendered width. The Room card requests seven section-grid
-rows so a wrapped status line cannot clip its footer.
+rows so a wrapped status line cannot clip its footer. Both Trend cards also request `rows: auto`.
 
 ## Development
 
@@ -146,7 +199,7 @@ Useful query parameters:
 | Parameter | Effect |
 |---|---|
 | `row=dark` / `row=light` | Show one theme |
-| `show=overview` / `show=cards` / `show=phone` / `show=dashboard` | Isolate a card group or hide the phone duplicate |
+| `show=overview` / `show=cards` / `show=charts` / `show=phone` / `show=dashboard` | Isolate a card group or hide the phone duplicate |
 | `scenario=healthy` / `scenario=alert` / `scenario=partial` | Stage sensor states |
 
 ## License

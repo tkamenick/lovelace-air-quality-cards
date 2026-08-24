@@ -41,6 +41,17 @@ sections:
           voc: sensor.upstairs_voc
           temperature: sensor.upstairs_temperature
           humidity: sensor.upstairs_humidity
+      - type: custom:air-quality-cards-trend
+        name: Upstairs trend
+        hours_to_show: 24
+        period: 5minute
+        room:
+          name: Upstairs
+          co2: sensor.upstairs_co2
+          pm25: sensor.upstairs_pm2_5
+          voc: sensor.upstairs_voc
+        grid_options:
+          columns: full
 
   - type: grid
     cards:
@@ -55,6 +66,17 @@ sections:
           voc: sensor.basement_voc
           temperature: sensor.basement_temperature
           humidity: sensor.basement_humidity
+      - type: custom:air-quality-cards-trend
+        name: Basement trend
+        hours_to_show: 24
+        period: 5minute
+        room:
+          name: Basement
+          co2: sensor.basement_co2
+          pm25: sensor.basement_pm2_5
+          voc: sensor.basement_voc
+        grid_options:
+          columns: full
 
   - type: grid
     column_span: 2
@@ -71,15 +93,15 @@ sections:
             radon: sensor.upstairs_radon
             # radon_average: sensor.upstairs_radon_30d_average
 
-      # Keep Home Assistant's recorder-backed graph for the long view. The
-      # custom card gives the current reading context; the graph answers trend.
-      - type: statistics-graph
-        title: Radon — 30-day daily averages
-        chart_type: line
-        period: day
+      - type: custom:air-quality-cards-radon-trend
+        name: Radon history
         days_to_show: 30
-        stat_types:
-          - mean
-        entities:
-          - sensor.basement_radon
-          - sensor.upstairs_radon
+        period: day
+        show_max: true
+        rooms:
+          - name: Basement
+            radon: sensor.basement_radon
+          - name: Upstairs
+            radon: sensor.upstairs_radon
+        grid_options:
+          columns: full

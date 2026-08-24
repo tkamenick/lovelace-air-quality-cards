@@ -14,6 +14,9 @@
   .col > :last-child { flex:1; min-height:0; }
   .col.wide { width:100%; max-width:1080px; height:auto; }
   .col.wide > :last-child { flex:none; }
+  .col.chart { width:min(530px, calc(50% - 9px)); min-width:340px; height:auto; }
+  .col.chart > :last-child { flex:none; }
+  .col.wide.chart { width:100%; max-width:1080px; }
   .col.phone { width:360px; height:auto; }
   .col.phone > :last-child { flex:none; }
   .hdg { font:500 16px/1.3 system-ui,-apple-system,sans-serif; color:var(--primary-text-color,#e1e1e1); padding:0 4px; }
@@ -67,6 +70,30 @@ const entity = (state, unit, minutesAgo = 1) => ({
   attributes: { unit_of_measurement: unit },
 });
 
+function statisticHistory(entityId, state, message) {
+  const end = new Date(message.end_time || Date.now()).getTime();
+  const start = new Date(message.start_time).getTime();
+  const count = message.period === 'day' ? 31 : message.period === 'hour' ? 25 : 49;
+  const step = (end - start) / Math.max(1, count - 1);
+  const current = Number(state?.state);
+  const seed = [...entityId].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const metric = entityId.includes('radon') ? 'radon' : entityId.includes('carbon') || entityId.includes('co2') ? 'co2' : entityId.includes('pm') ? 'pm25' : 'voc';
+  const amplitude = metric === 'co2' ? 85 : metric === 'voc' ? 65 : metric === 'radon' ? Math.max(8, current * 0.24) : 4;
+  return Array.from({ length: count }, (_, index) => {
+    const phase = index / Math.max(1, count - 1);
+    const wave = Math.sin(phase * Math.PI * 3 + seed / 17) * amplitude;
+    const pulse = metric === 'pm25' && index % 13 === 8 ? 7 : 0;
+    const drift = (phase - 1) * amplitude * 0.35;
+    const mean = Math.max(0, current + wave + pulse + drift);
+    return {
+      start: Math.round(start + index * step),
+      end: Math.round(start + (index + 1) * step),
+      mean,
+      max: mean + Math.max(amplitude * 0.42, metric === 'pm25' ? 2 : 1),
+    };
+  });
+}
+
 const makeHass = (darkMode, scenario = 'healthy') => {
   const elevated = scenario === 'alert';
   const states = {
@@ -89,7 +116,14 @@ const makeHass = (darkMode, scenario = 'healthy') => {
     states['sensor.upstairs_voc'].state = 'unavailable';
     delete states['sensor.basement_pm25'];
   }
-  return { themes: { darkMode }, states };
+  return {
+    themes: { darkMode },
+    states,
+    callWS: async (message) => {
+      if (message.type !== 'recorder/statistics_during_period') throw new Error(`unsupported harness request: ${message.type}`);
+      return Object.fromEntries(message.statistic_ids.map((entityId) => [entityId, statisticHistory(entityId, states[entityId], message)]));
+    },
+  };
 };
 
 const ROOMS = [
@@ -132,8 +166,13 @@ function addSuite(row, hass) {
   addCard(row, 'air-quality-cards-overview', 'Air quality', { rooms: ROOMS }, hass, 'wide');
   addCard(row, 'air-quality-cards-room', 'Upstairs', { room: ROOMS[0] }, hass);
   addCard(row, 'air-quality-cards-room', 'Basement', { room: ROOMS[1] }, hass);
+  addCard(row, 'air-quality-cards-trend', 'Upstairs · history', { name: 'Upstairs trend', room: ROOMS[0] }, hass, 'chart');
+  addCard(row, 'air-quality-cards-trend', 'Basement · history', { name: 'Basement trend', room: ROOMS[1] }, hass, 'chart');
   addCard(row, 'air-quality-cards-radon', 'Radon', { rooms: ROOMS }, hass, 'wide');
+  addCard(row, 'air-quality-cards-radon-trend', 'Radon · history', { rooms: ROOMS }, hass, 'wide chart');
   addCard(row, 'air-quality-cards-overview', 'Phone width', { rooms: ROOMS }, hass, 'phone');
+  addCard(row, 'air-quality-cards-trend', 'Phone trend', { name: 'Upstairs trend', room: ROOMS[0] }, hass, 'phone chart');
+  addCard(row, 'air-quality-cards-radon-trend', 'Phone radon trend', { rooms: ROOMS }, hass, 'phone chart');
 }
 
 const scenario = (/[?&]scenario=(\w+)/.exec(location.search) || [])[1];
@@ -153,6 +192,7 @@ if (show === 'overview') document.querySelectorAll('.col:not(.wide), .col.phone'
 if (show === 'cards') document.querySelectorAll('.col.wide, .col.phone').forEach((el) => el.remove());
 if (show === 'phone') document.querySelectorAll('.col:not(.phone)').forEach((el) => el.remove());
 if (show === 'dashboard') document.querySelectorAll('.col.phone').forEach((el) => el.remove());
+if (show === 'charts') document.querySelectorAll('.col:not(.chart), .col.phone').forEach((el) => el.remove());
 </script>
 </body>
 </html>

@@ -1,17 +1,19 @@
 /*! Air Quality Cards — a Lovelace card set for Home Assistant
  *  https://github.com/tkamenick/lovelace-air-quality-cards
  *
- *  Three cards:
+ *  Five cards:
  *    · custom:air-quality-cards-overview — whole-home air status and room comparison
  *    · custom:air-quality-cards-room     — one room, with four pollutant ranges
  *    · custom:air-quality-cards-radon    — radon comparison with the EPA action line
+ *    · custom:air-quality-cards-trend    — normalized small-multiple pollutant history
+ *    · custom:air-quality-cards-radon-trend — multi-room long-term radon history
  *
  *  No external dependencies. Sensor entities and thresholds are configurable.
  */
 (() => {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.0';
   const REPO = 'https://github.com/tkamenick/lovelace-air-quality-cards';
 
   const ACCENTS = {
@@ -74,6 +76,7 @@
   };
 
   const METRIC_ORDER = ['radon', 'co2', 'pm25', 'voc'];
+  const METRIC_ACCENTS = { radon: 'pink', co2: 'blue', pm25: 'green', voc: 'amber' };
   const METRICS = {
     radon: {
       label: 'Radon',
@@ -306,6 +309,70 @@
       <span style="font-family:${MONO}; font-size:10px; color:${C.faint}; text-transform:uppercase; letter-spacing:0.08em;">${label}</span>
       <span style="font-size:14px; color:${C.ink}; white-space:nowrap;">${reading}</span>
     </span>`;
+  }
+
+  function durationLabel(milliseconds) {
+    const hours = Math.round(milliseconds / 3600000);
+    if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'}`;
+    const days = Math.round(hours / 24);
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+
+  function timeTick(timestamp, spanMs) {
+    const date = new Date(timestamp);
+    if (spanMs <= 48 * 3600000) {
+      return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
+    }
+    return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
+  }
+
+  function statisticsPoints(rows, stat = 'mean', startTime = -Infinity, endTime = Infinity) {
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => ({ t: finite(row?.start), value: finite(row?.[stat]) }))
+      .filter((point) => Number.isFinite(point.t) && Number.isFinite(point.value) && point.t >= startTime && point.t <= endTime)
+      .sort((a, b) => a.t - b.t);
+  }
+
+  function plotPoints(points, bounds) {
+    const spanX = Math.max(1, bounds.end - bounds.start);
+    const spanY = Math.max(0.0001, bounds.max - bounds.min);
+    return points.map((point) => ({
+      ...point,
+      x: bounds.left + ((point.t - bounds.start) / spanX) * (bounds.right - bounds.left),
+      y: bounds.bottom - ((point.value - bounds.min) / spanY) * (bounds.bottom - bounds.top),
+    }));
+  }
+
+  function linePath(points) {
+    return points.map((point, index) => `${index ? 'L' : 'M'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ');
+  }
+
+  function areaPath(points, bottom) {
+    if (!points.length) return '';
+    return `${linePath(points)} L ${points[points.length - 1].x.toFixed(2)} ${bottom.toFixed(2)} L ${points[0].x.toFixed(2)} ${bottom.toFixed(2)} Z`;
+  }
+
+  function metricForSeries(series) {
+    if (METRICS[series.metric]) return series.metric;
+    const haystack = `${series.entity || ''} ${series.name || ''}`.toLowerCase();
+    if (haystack.includes('radon')) return 'radon';
+    if (haystack.includes('carbon_dioxide') || haystack.includes('co2') || haystack.includes('co₂')) return 'co2';
+    if (haystack.includes('pm2') || haystack.includes('pm25')) return 'pm25';
+    if (haystack.includes('voc')) return 'voc';
+    return null;
+  }
+
+  function currentSeriesReading(hass, series) {
+    const metric = metricForSeries(series);
+    const state = hass?.states?.[series.entity];
+    const value = state ? finite(state.state) : NaN;
+    return {
+      entity: series.entity,
+      value,
+      available: Number.isFinite(value),
+      unit: state?.attributes?.unit_of_measurement || (metric ? METRICS[metric].unit : ''),
+      metric,
+    };
   }
 
   class AirQualityCardsBase extends HTMLElement {
@@ -734,9 +801,450 @@
     }
   }
 
+  class AirQualityCardsTrendBase extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: 'open' });
+      this._data = {};
+      this._loading = false;
+      this._error = null;
+      this._requestToken = 0;
+    }
+
+    setConfig(config) {
+      this._config = this._normalizeConfig(config || {});
+      this._data = {};
+      this._error = null;
+      this._lastFetch = 0;
+      if (this._hass) {
+        this._render();
+        this._maybeLoad();
+      }
+    }
+
+    set hass(hass) {
+      const connectionChanged = this._hass?.connection !== hass?.connection;
+      this._hass = hass;
+      if (!this._config) return;
+      if (this._config.load_fonts !== false) loadFonts();
+      if (connectionChanged) this._lastFetch = 0;
+      this._render();
+      this._maybeLoad();
+    }
+
+    get hass() {
+      return this._hass;
+    }
+
+    connectedCallback() {
+      this._connected = true;
+      this._maybeLoad();
+      this._refreshTimer = setInterval(() => this._maybeLoad(true), (this._config?.refresh_interval || 300) * 1000);
+    }
+
+    disconnectedCallback() {
+      this._connected = false;
+      clearInterval(this._refreshTimer);
+    }
+
+    async _maybeLoad(force = false) {
+      if (!this._config || !this._hass?.callWS || this._loading) return;
+      const refreshMs = (this._config.refresh_interval || 300) * 1000;
+      if (!force && this._lastFetch && Date.now() - this._lastFetch < refreshMs) return;
+      const token = ++this._requestToken;
+      this._loading = true;
+      this._error = null;
+      this._render();
+      try {
+        const data = await this._hass.callWS(this._request());
+        if (token !== this._requestToken) return;
+        this._data = data || {};
+        this._lastFetch = Date.now();
+      } catch (error) {
+        if (token !== this._requestToken) return;
+        this._error = error?.message || String(error);
+      } finally {
+        if (token === this._requestToken) {
+          this._loading = false;
+          this._render();
+        }
+      }
+    }
+
+    _pal() {
+      return palette(this._hass?.themes?.darkMode !== false);
+    }
+
+    _card(inner) {
+      const C = this._pal();
+      return `<ha-card style="display:flex; flex-direction:column; box-sizing:border-box; height:100%; padding:24px 26px 22px; color:${C.text}; font-family:${SANS};">${inner}</ha-card>`;
+    }
+
+    _header(left, right, rightColor) {
+      const C = this._pal();
+      return `<div class="trend-header">
+        <div class="trend-kicker">${esc(left)}</div>
+        <div class="trend-meta" style="color:${rightColor || C.faint};">${esc(right)}</div>
+      </div>`;
+    }
+
+    _render() {
+      if (!this._config || !this.shadowRoot) return;
+      let html;
+      try {
+        html = this._template();
+      } catch (error) {
+        html = `<ha-card style="display:block; padding:16px; font-family:${MONO}; font-size:12px;">air-quality-cards error: ${esc(error?.message || error)}</ha-card>`;
+      }
+      this.shadowRoot.innerHTML = html;
+      this.shadowRoot.querySelectorAll('[data-entity]').forEach((el) => {
+        const open = () => {
+          this.dispatchEvent(
+            new CustomEvent('hass-more-info', {
+              bubbles: true,
+              composed: true,
+              detail: { entityId: el.dataset.entity },
+            })
+          );
+        };
+        el.addEventListener('click', open);
+        el.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            open();
+          }
+        });
+      });
+    }
+
+    getCardSize() {
+      return this.constructor.cardSize || 6;
+    }
+
+    getGridOptions() {
+      return { columns: 'full', rows: 'auto', min_columns: 6 };
+    }
+  }
+
+  class AirQualityCardsTrend extends AirQualityCardsTrendBase {
+    static cardSize = 6;
+
+    static getStubConfig() {
+      return {
+        name: 'Upstairs trend',
+        room: {
+          name: 'Upstairs',
+          co2: 'sensor.upstairs_co2',
+          pm25: 'sensor.upstairs_pm2_5',
+          voc: 'sensor.upstairs_voc',
+        },
+      };
+    }
+
+    _normalizeConfig(config) {
+      const cfg = {
+        name: '',
+        hours_to_show: 24,
+        period: '5minute',
+        metrics: ['co2', 'pm25', 'voc'],
+        refresh_interval: 300,
+        load_fonts: true,
+        ...config,
+      };
+      cfg.thresholds = mergeThresholds(cfg);
+      const room = normalizeRoom(cfg.room || {}, 0);
+      cfg.room = room;
+      const rawSeries = Array.isArray(cfg.series) && cfg.series.length
+        ? cfg.series
+        : (Array.isArray(cfg.metrics) ? cfg.metrics : []).map((metric) => ({ metric, entity: room[metric] }));
+      cfg.series = rawSeries
+        .map((series) => {
+          const item = typeof series === 'string' ? { entity: series } : { ...series };
+          const metric = metricForSeries(item);
+          if (!metric) throw new Error(`trend series ${item.entity || ''} needs metric: radon, co2, pm25, or voc`);
+          return {
+            entity: item.entity || room[metric],
+            metric,
+            name: item.name || METRICS[metric].label,
+          };
+        })
+        .filter((series) => series.entity);
+      if (!cfg.series.length) throw new Error('trend card needs at least one configured series');
+      cfg.hours_to_show = Math.max(1, finite(cfg.hours_to_show) || 24);
+      if (!['5minute', 'hour', 'day'].includes(cfg.period)) throw new Error('trend period must be 5minute, hour, or day');
+      return cfg;
+    }
+
+    _request() {
+      const end = new Date();
+      const start = new Date(end.getTime() - this._config.hours_to_show * 3600000);
+      return {
+        type: 'recorder/statistics_during_period',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        statistic_ids: this._config.series.map((series) => series.entity),
+        period: this._config.period,
+        types: ['mean'],
+      };
+    }
+
+    _template() {
+      const C = this._pal();
+      const spanMs = this._config.hours_to_show * 3600000;
+      const end = Date.now();
+      const start = end - spanMs;
+      const periodCopy = this._config.period === '5minute' ? '5 min mean' : `${this._config.period} mean`;
+      const meta = this._error
+        ? 'history unavailable'
+        : this._loading && !Object.keys(this._data).length
+          ? 'loading history…'
+          : `${durationLabel(spanMs)} · ${periodCopy}`;
+      const rows = this._config.series
+        .map((series) => {
+          const metric = series.metric;
+          const metricCfg = METRICS[metric];
+          const threshold = this._config.thresholds[metric];
+          const current = currentSeriesReading(this._hass, series);
+          const status = metricState(metric, current.value, this._config.thresholds);
+          const statusColor = colorFor(C, status.severity);
+          const lineColor = C[METRIC_ACCENTS[metric]];
+          const points = statisticsPoints(this._data?.[series.entity], 'mean', start, end);
+          const values = points.map((point) => point.value);
+          const dataMax = values.length ? Math.max(...values) : 0;
+          const yMax = Math.max(threshold.action * 1.12, dataMax * 1.08, 1);
+          const bounds = { left: 2, right: 718, top: 8, bottom: 76, start, end, min: 0, max: yMax };
+          const plotted = plotPoints(points, bounds);
+          const path = linePath(plotted);
+          const fill = areaPath(plotted, bounds.bottom);
+          const goodY = bounds.bottom - (threshold.good / yMax) * (bounds.bottom - bounds.top);
+          const actionY = bounds.bottom - (threshold.action / yMax) * (bounds.bottom - bounds.top);
+          const last = plotted[plotted.length - 1];
+          const delta = points.length > 1 ? points[points.length - 1].value - points[0].value : NaN;
+          const deltaText = Number.isFinite(delta)
+            ? `${delta > 0 ? '+' : ''}${delta.toLocaleString(undefined, { maximumFractionDigits: metricCfg.decimals || 0 })}`
+            : '—';
+          const valueText = current.available
+            ? `${current.value.toLocaleString(undefined, { maximumFractionDigits: metricCfg.decimals })} ${current.unit || metricCfg.unit}`
+            : '—';
+          const chart = plotted.length
+            ? `<svg viewBox="0 0 720 84" preserveAspectRatio="none" role="img" aria-label="${esc(`${series.name} ${durationLabel(spanMs)} history`)}">
+                <defs>
+                  <linearGradient id="fill-${metric}" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0" stop-color="${lineColor}" stop-opacity="0.22"></stop>
+                    <stop offset="1" stop-color="${lineColor}" stop-opacity="0"></stop>
+                  </linearGradient>
+                </defs>
+                <line x1="2" x2="718" y1="${goodY.toFixed(2)}" y2="${goodY.toFixed(2)}" stroke="${C.good}" stroke-opacity="0.18" stroke-dasharray="4 6"></line>
+                <line x1="2" x2="718" y1="${actionY.toFixed(2)}" y2="${actionY.toFixed(2)}" stroke="${C.action}" stroke-opacity="0.28" stroke-dasharray="4 6"></line>
+                <path d="${fill}" fill="url(#fill-${metric})"></path>
+                <path d="${path}" fill="none" stroke="${lineColor}" stroke-width="2.4" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round"></path>
+                ${last ? `<circle cx="${last.x.toFixed(2)}" cy="${last.y.toFixed(2)}" r="3.5" fill="${C.surface}" stroke="${lineColor}" stroke-width="2" vector-effect="non-scaling-stroke"><title>${esc(`${last.value} ${current.unit || metricCfg.unit}`)}</title></circle>` : ''}
+              </svg>`
+            : `<div class="empty-line">${this._loading ? 'loading recorder data…' : 'no recorder statistics in this range'}</div>`;
+          return `<section class="trend-row" data-entity="${esc(series.entity)}" role="button" tabindex="0">
+            <div class="series-head">
+              <div class="series-name"><span class="series-dot" style="background:${lineColor};"></span>${esc(series.name)}</div>
+              <div class="series-status" style="color:${statusColor};">${esc(status.label)}</div>
+              <div class="series-delta">Δ ${deltaText}</div>
+              <div class="series-value">${esc(valueText)}</div>
+            </div>
+            <div class="sparkline">${chart}</div>
+          </section>`;
+        })
+        .join('');
+      const style = `<style>
+        .trend-header { display:flex; align-items:baseline; justify-content:space-between; gap:14px; }
+        .trend-kicker { font-family:${MONO}; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:${C.dim}; }
+        .trend-meta { font-family:${MONO}; font-size:10px; white-space:nowrap; }
+        .trend-body { display:flex; flex-direction:column; padding-top:10px; }
+        .trend-row { display:block; padding:14px 0 12px; border-top:1px solid ${C.divider}; cursor:pointer; outline:none; }
+        .trend-row:first-child { border-top:0; }
+        .trend-row:focus-visible { border-radius:8px; box-shadow:0 0 0 2px ${C.blue}; }
+        .series-head { display:grid; grid-template-columns:minmax(80px,1fr) auto auto auto; gap:12px; align-items:baseline; margin-bottom:7px; }
+        .series-name { display:flex; align-items:center; gap:9px; font-size:15px; font-weight:600; min-width:0; }
+        .series-dot { width:7px; height:7px; border-radius:99px; flex:none; }
+        .series-status, .series-delta { font-family:${MONO}; font-size:9px; text-transform:uppercase; letter-spacing:0.06em; white-space:nowrap; }
+        .series-delta { color:${C.faint}; }
+        .series-value { font-size:14px; color:${C.ink}; text-align:right; white-space:nowrap; }
+        .sparkline { height:84px; }
+        .sparkline svg { display:block; width:100%; height:100%; overflow:visible; }
+        .empty-line { height:100%; display:flex; align-items:center; justify-content:center; border-radius:8px; background:color-mix(in srgb, ${C.line} 3%, transparent); font-family:${MONO}; font-size:10px; color:${C.faint}; }
+        .time-axis { display:grid; grid-template-columns:1fr 1fr 1fr; padding-top:10px; border-top:1px solid ${C.divider}; font-family:${MONO}; font-size:9px; color:${C.faint}; }
+        .time-axis span:nth-child(2) { text-align:center; }
+        .time-axis span:last-child { text-align:right; }
+        @media (max-width: 460px) {
+          ha-card { padding-left:18px !important; padding-right:18px !important; }
+          .series-head { grid-template-columns:1fr auto; gap:5px 10px; }
+          .series-status { grid-column:1; }
+          .series-delta { display:none; }
+          .series-value { grid-column:2; grid-row:1 / span 2; }
+        }
+      </style>`;
+      return this._card(`${this._header(this._config.name || `${this._config.room.name} trend`, meta, this._error ? C.action : null)}
+        ${style}
+        <div class="trend-body">${rows}</div>
+        <div class="time-axis"><span>${esc(timeTick(start, spanMs))}</span><span>${esc(timeTick(start + spanMs / 2, spanMs))}</span><span>now</span></div>`);
+    }
+  }
+
+  class AirQualityCardsRadonTrend extends AirQualityCardsTrendBase {
+    static cardSize = 6;
+
+    static getStubConfig() {
+      return {
+        rooms: [
+          { name: 'Basement', radon: 'sensor.basement_radon' },
+          { name: 'Upstairs', radon: 'sensor.upstairs_radon' },
+        ],
+      };
+    }
+
+    _normalizeConfig(config) {
+      const cfg = {
+        name: 'Radon history',
+        days_to_show: 30,
+        period: 'day',
+        show_max: true,
+        refresh_interval: 900,
+        load_fonts: true,
+        ...config,
+      };
+      cfg.thresholds = mergeThresholds(cfg);
+      cfg.rooms = (Array.isArray(cfg.rooms) ? cfg.rooms : []).map(normalizeRoom).filter((room) => room.radon);
+      if (!cfg.rooms.length) throw new Error('radon trend card needs at least one room with a radon entity');
+      cfg.days_to_show = Math.max(2, finite(cfg.days_to_show) || 30);
+      if (!['hour', 'day', 'week', 'month'].includes(cfg.period)) throw new Error('radon trend period must be hour, day, week, or month');
+      return cfg;
+    }
+
+    _request() {
+      const end = new Date();
+      const start = new Date(end.getTime() - this._config.days_to_show * 86400000);
+      return {
+        type: 'recorder/statistics_during_period',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        statistic_ids: this._config.rooms.map((room) => room.radon),
+        period: this._config.period,
+        types: this._config.show_max ? ['mean', 'max'] : ['mean'],
+      };
+    }
+
+    _template() {
+      const C = this._pal();
+      const spanMs = this._config.days_to_show * 86400000;
+      const end = Date.now();
+      const start = end - spanMs;
+      const threshold = this._config.thresholds.radon;
+      const colors = [C.blue, C.amber, C.green, C.pink];
+      const series = this._config.rooms.map((room, index) => {
+        const rows = this._data?.[room.radon] || [];
+        return {
+          room,
+          color: colors[index % colors.length],
+          mean: statisticsPoints(rows, 'mean', start, end),
+          max: this._config.show_max ? statisticsPoints(rows, 'max', start, end) : [],
+        };
+      });
+      const values = series.flatMap((item) => [...item.mean, ...item.max]).map((point) => point.value);
+      const dataMax = values.length ? Math.max(...values) : 0;
+      const yMax = Math.max(threshold.action * 1.16, dataMax * 1.08, 10);
+      const bounds = { left: 6, right: 906, top: 14, bottom: 220, start, end, min: 0, max: yMax };
+      const yFor = (value) => bounds.bottom - (value / yMax) * (bounds.bottom - bounds.top);
+      const gridValues = [...new Set([0, threshold.good, threshold.action, Math.round(yMax)])].sort((a, b) => a - b);
+      const grid = gridValues
+        .map((value) => {
+          const isAction = value === threshold.action;
+          const isGood = value === threshold.good;
+          const color = isAction ? C.action : isGood ? C.good : C.line;
+          const opacity = isAction ? 0.55 : isGood ? 0.22 : 0.1;
+          return `<line x1="${bounds.left}" x2="${bounds.right}" y1="${yFor(value).toFixed(2)}" y2="${yFor(value).toFixed(2)}" stroke="${color}" stroke-opacity="${opacity}" stroke-dasharray="${isAction || isGood ? '5 7' : '2 8'}"></line>
+            <text x="922" y="${(yFor(value) + 3).toFixed(2)}" fill="${isAction ? C.action : C.faint}" font-family="${MONO_SVG}" font-size="9">${isAction ? `${value} action` : value}</text>`;
+        })
+        .join('');
+      const paths = series
+        .map((item) => {
+          const mean = plotPoints(item.mean, bounds);
+          const max = plotPoints(item.max, bounds);
+          const last = mean[mean.length - 1];
+          return `${max.length ? `<path d="${linePath(max)}" fill="none" stroke="${item.color}" stroke-width="1.2" stroke-opacity="0.38" stroke-dasharray="4 6" vector-effect="non-scaling-stroke"></path>` : ''}
+            ${mean.length ? `<path d="${linePath(mean)}" fill="none" stroke="${item.color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"></path>` : ''}
+            ${last ? `<circle cx="${last.x.toFixed(2)}" cy="${last.y.toFixed(2)}" r="4" fill="${C.surface}" stroke="${item.color}" stroke-width="2.2" vector-effect="non-scaling-stroke"><title>${esc(`${item.room.name}: ${last.value.toLocaleString(undefined, { maximumFractionDigits: 0 })} Bq/m³ mean`)}</title></circle>` : ''}`;
+        })
+        .join('');
+      const ticks = [0, 1 / 3, 2 / 3, 1]
+        .map((fraction) => {
+          const x = bounds.left + fraction * (bounds.right - bounds.left);
+          const timestamp = start + fraction * spanMs;
+          return `<text x="${x.toFixed(2)}" y="244" text-anchor="${fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'}" fill="${C.faint}" font-family="${MONO_SVG}" font-size="9">${esc(fraction === 1 ? 'now' : timeTick(timestamp, spanMs))}</text>`;
+        })
+        .join('');
+      const legends = series
+        .map((item) => {
+          const latest = item.mean[item.mean.length - 1];
+          const latestMax = item.max[item.max.length - 1];
+          const live = stateFor(this._hass, item.room.radon, 'radon');
+          const status = metricState('radon', latest?.value ?? live.value, this._config.thresholds);
+          return `<div class="radon-legend" data-entity="${esc(item.room.radon)}" role="button" tabindex="0">
+            <span class="legend-line" style="background:${item.color};"></span>
+            <span class="legend-name">${esc(item.room.name)}</span>
+            <span class="legend-status" style="color:${colorFor(C, status.severity)};">${esc(status.label)}</span>
+            <strong>${latest ? latest.value.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'} <small>Bq/m³ mean</small></strong>
+            ${this._config.show_max ? `<span class="legend-max">${latestMax ? latestMax.value.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'} max</span>` : ''}
+          </div>`;
+        })
+        .join('');
+      const hasData = series.some((item) => item.mean.length);
+      const chart = hasData
+        ? `<svg viewBox="0 0 960 252" preserveAspectRatio="none" role="img" aria-label="${esc(`${this._config.days_to_show} day radon history`)}">${grid}${paths}${ticks}</svg>`
+        : `<div class="radon-empty">${this._loading ? 'loading recorder data…' : this._error ? esc(this._error) : 'no recorder statistics in this range'}</div>`;
+      const meta = this._error
+        ? 'history unavailable'
+        : this._loading && !hasData
+          ? 'loading history…'
+          : `${this._config.days_to_show} days · ${this._config.period} mean${this._config.show_max ? ' + max' : ''}`;
+      const style = `<style>
+        .trend-header { display:flex; align-items:baseline; justify-content:space-between; gap:14px; }
+        .trend-kicker { font-family:${MONO}; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:${C.dim}; }
+        .trend-meta { font-family:${MONO}; font-size:10px; white-space:nowrap; }
+        .radon-legends { display:grid; grid-template-columns:repeat(${Math.min(series.length, 3)},minmax(0,1fr)); gap:0; padding:18px 0 14px; }
+        .radon-legend { display:grid; grid-template-columns:auto 1fr auto; gap:4px 9px; align-items:baseline; padding:0 20px; border-left:1px solid ${C.divider}; cursor:pointer; outline:none; }
+        .radon-legend:first-child { border-left:0; padding-left:0; }
+        .radon-legend:last-child { padding-right:0; }
+        .radon-legend:focus-visible { border-radius:8px; box-shadow:0 0 0 2px ${C.blue}; }
+        .legend-line { width:17px; height:3px; border-radius:99px; }
+        .legend-name { font-size:15px; font-weight:600; }
+        .legend-status { font-family:${MONO}; font-size:9px; text-transform:uppercase; letter-spacing:0.06em; }
+        .radon-legend strong { grid-column:2 / 4; font-size:20px; font-weight:600; color:${C.ink}; }
+        .radon-legend small { font-family:${MONO}; font-size:9px; font-weight:400; color:${C.faint}; }
+        .legend-max { grid-column:2 / 4; font-family:${MONO}; font-size:9px; color:${C.faint}; }
+        .radon-chart { min-height:252px; padding-top:6px; border-top:1px solid ${C.divider}; }
+        .radon-chart svg { display:block; width:100%; height:252px; overflow:visible; }
+        .radon-empty { min-height:220px; display:flex; align-items:center; justify-content:center; font-family:${MONO}; font-size:10px; color:${C.faint}; }
+        .radon-foot { display:flex; justify-content:space-between; gap:18px; padding-top:13px; margin-top:4px; border-top:1px solid ${C.divider}; font-family:${MONO}; font-size:9px; color:${C.faint}; }
+        .radon-foot strong { color:${C.action}; font-weight:400; }
+        @media (max-width: 600px) {
+          ha-card { padding-left:18px !important; padding-right:18px !important; }
+          .radon-legends { grid-template-columns:1fr; padding-bottom:6px; }
+          .radon-legend, .radon-legend:first-child, .radon-legend:last-child { padding:12px 0; border-left:0; border-top:1px solid ${C.divider}; }
+          .radon-legend:first-child { border-top:0; }
+          .radon-chart svg { height:220px; }
+          .radon-foot { flex-direction:column; gap:5px; }
+        }
+      </style>`;
+      return this._card(`${this._header(this._config.name, meta, this._error ? C.action : null)}
+        ${style}
+        <div class="radon-legends">${legends}</div>
+        <div class="radon-chart">${chart}</div>
+        <div class="radon-foot"><span><strong>${threshold.action} Bq/m³</strong> · EPA action level</span><span>solid = mean · dashed = daily max</span></div>`);
+    }
+  }
+
   customElements.define('air-quality-cards-overview', AirQualityCardsOverview);
   customElements.define('air-quality-cards-room', AirQualityCardsRoom);
   customElements.define('air-quality-cards-radon', AirQualityCardsRadon);
+  customElements.define('air-quality-cards-trend', AirQualityCardsTrend);
+  customElements.define('air-quality-cards-radon-trend', AirQualityCardsRadonTrend);
 
   window.customCards = window.customCards || [];
   window.customCards.push(
@@ -760,10 +1268,33 @@
       preview: true,
       description: 'Multi-room radon comparison with the EPA action level and optional long-term averages.',
       documentationURL: REPO,
+    },
+    {
+      type: 'air-quality-cards-trend',
+      name: 'Air Quality Cards · Trend',
+      preview: true,
+      description: 'Recorder-backed, normalized small-multiple trends for one room.',
+      documentationURL: REPO,
+    },
+    {
+      type: 'air-quality-cards-radon-trend',
+      name: 'Air Quality Cards · Radon Trend',
+      preview: true,
+      description: 'Multi-room long-term radon mean and max trends with the EPA action line.',
+      documentationURL: REPO,
     }
   );
 
-  window.__AIR_QUALITY_CARDS__ = { VERSION, METRICS, metricState, mergeThresholds };
+  window.__AIR_QUALITY_CARDS__ = {
+    VERSION,
+    METRICS,
+    metricState,
+    mergeThresholds,
+    statisticsPoints,
+    plotPoints,
+    linePath,
+    areaPath,
+  };
 
   console.info(
     `%c AIR-QUALITY-CARDS %c v${VERSION} `,

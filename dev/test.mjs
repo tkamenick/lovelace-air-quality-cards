@@ -26,11 +26,13 @@ globalThis.cancelAnimationFrame = () => {};
 await import('../air-quality-cards.js');
 
 const M = globalThis.__AIR_QUALITY_CARDS__;
-assert.equal(M.VERSION, '0.1.0');
+assert.equal(M.VERSION, '0.2.0');
 assert.deepEqual([...registry.keys()], [
   'air-quality-cards-overview',
   'air-quality-cards-room',
   'air-quality-cards-radon',
+  'air-quality-cards-trend',
+  'air-quality-cards-radon-trend',
 ]);
 
 const thresholds = M.mergeThresholds({});
@@ -89,4 +91,47 @@ assert.equal(averagedRadon.current.value, 200);
 assert.equal(averagedRadon.status.severity, 0);
 assert.equal(averagedRadon.basis, 'average');
 
-console.log(`air-quality-cards: ${cases.length + 10} assertions passed`);
+const TrendCard = registry.get('air-quality-cards-trend');
+const trendCard = new TrendCard();
+trendCard.setConfig({
+  room: {
+    name: 'Test room',
+    co2: 'sensor.test_co2',
+    pm25: 'sensor.test_pm25',
+    voc: 'sensor.test_voc',
+  },
+});
+assert.deepEqual(
+  trendCard._config.series.map(({ entity, metric }) => ({ entity, metric })),
+  [
+    { entity: 'sensor.test_co2', metric: 'co2' },
+    { entity: 'sensor.test_pm25', metric: 'pm25' },
+    { entity: 'sensor.test_voc', metric: 'voc' },
+  ]
+);
+
+const RadonTrendCard = registry.get('air-quality-cards-radon-trend');
+const radonTrendCard = new RadonTrendCard();
+radonTrendCard.setConfig({ rooms: [{ name: 'Basement', radon: 'sensor.basement_radon' }] });
+assert.equal(radonTrendCard._config.rooms[0].radon, 'sensor.basement_radon');
+assert.deepEqual(radonTrendCard.getGridOptions(), { columns: 'full', rows: 'auto', min_columns: 6 });
+
+const points = M.statisticsPoints(
+  [
+    { start: 3000, mean: 30 },
+    { start: 1000, mean: 10 },
+    { start: 2000, mean: 'unknown' },
+  ],
+  'mean',
+  0,
+  4000
+);
+assert.deepEqual(points, [
+  { t: 1000, value: 10 },
+  { t: 3000, value: 30 },
+]);
+const plotted = M.plotPoints(points, { left: 0, right: 100, top: 0, bottom: 50, start: 1000, end: 3000, min: 0, max: 50 });
+assert.equal(M.linePath(plotted), 'M 0.00 40.00 L 100.00 20.00');
+assert.match(M.areaPath(plotted, 50), /Z$/);
+
+console.log(`air-quality-cards: ${cases.length + 20} assertions passed`);
